@@ -65,7 +65,7 @@ body{background:#0a0a0f;color:#d1d4dc;font-family:'Segoe UI',system-ui,sans-seri
 <body>
 
 <div id="auth-overlay">
-  <div class="msg">FXペアにはAPIキーが必要です。<br><a href="https://note.com/ishinabegen/membership" target="_blank" style="color:#2962ff">初月無料で試せます</a></div>
+  <div class="msg">FXペアにはAPIキーが必要です。<br>noteのメンバーシップで配信しています。<a href="https://note.com/ishinabegen/membership" target="_blank" style="color:#2962ff">初月無料</a></div>
   <input type="text" id="api-key-input" placeholder="tk_xxxxxxxx" spellcheck="false"
     onkeydown="if(event.key==='Enter')submitApiKey()" />
   <div style="display:flex;gap:8px">
@@ -343,6 +343,7 @@ function onSymbolSelect(sym) {
 function submitApiKey() {
   apiKey = document.getElementById('api-key-input').value.trim();
   if (!apiKey) return;
+  try { localStorage.setItem('tick_api_key', apiKey); } catch(e) {}
   document.getElementById('auth-overlay').style.display = 'none';
   if (pendingFxSymbol) {
     currentSymbol = pendingFxSymbol;
@@ -575,6 +576,7 @@ async function loadHistory(symbol, tfIdx) {
 
 /* ── Boot ───────────────────────────────────── */
 (function boot() {
+  try { apiKey = localStorage.getItem('tick_api_key') || ''; } catch(e) {}
   initUI();
   initChart();
   loadHistory(currentSymbol, currentTfIdx);
