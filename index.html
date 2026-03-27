@@ -65,7 +65,7 @@ body{background:#0a0a0f;color:#d1d4dc;font-family:'Segoe UI',system-ui,sans-seri
 <body>
 
 <div id="auth-overlay">
-  <div class="msg">FXは<a href="https://note.com/ishinabegen/membership" target="_blank" style="color:#2962ff">初月無料</a>で試せます</div>
+  <div class="msg">FXペアにはAPIキーが必要です。<br><a href="https://note.com/ishinabegen/membership" target="_blank" style="color:#2962ff">初月無料で試せます</a></div>
   <input type="text" id="api-key-input" placeholder="tk_xxxxxxxx" spellcheck="false"
     onkeydown="if(event.key==='Enter')submitApiKey()" />
   <div style="display:flex;gap:8px">
@@ -105,8 +105,6 @@ const FX = [
   {sym:'AUDNZD',d:5,pip:10000},{sym:'XAUUSD',d:2,pip:1},
 ];
 const ALL_SYMS = [...CRYPTO, ...FX];
-const SYM_MAP = new Map(ALL_SYMS.map(s => [s.sym, s]));
-const CRYPTO_SET = new Set(CRYPTO.map(c => c.sym));
 
 const TIMEFRAMES = [
   {label:'Tick',sec:0},
@@ -118,14 +116,14 @@ const TIMEFRAMES = [
 
 const JST = 9*3600;
 const BUFFER_MS = 60*60*1000;
-const BUFFER_MAX = 360000; // hard cap: ~20 min at 300 t/s
 const TICK_MAX = 8000;
 
 /* ── State ──────────────────────────────────── */
 let apiKey = '';
 let ws = null;
+let currentSource = 'binance'; // 'binance' | 'tickagg'
 let chart = null;
-let candleSeries = null, volumeSeries = null;
+let candleSeries = null, volumeSeries = null, bidLineSeries = null, askLineSeries = null;
 let currentSymbol = 'BTCUSDT';
 let currentTfIdx = 5; // 1m
 let tickBuffer = [];
@@ -135,20 +133,14 @@ let tickModeBase = 0, tickModeIdx = 0;
 let tpsCount = 0, tpsLast = performance.now();
 let pendingFxSymbol = null;
 let reconnectTimer = null;
-let historyReqId = 0; // race condition guard
-let cachedInfo = null; // cached symInfo for hot path
-
-// DOM element cache (populated in boot)
-let $bid, $ask, $spread, $tps, $candleTicks, $status;
-// Change-detection for DOM writes
-let _lastBid = '', _lastAsk = '', _lastSp = '', _lastCrossed = null;
 
 /* ── Helpers ────────────────────────────────── */
-function symInfo(sym) { return SYM_MAP.get(sym) || {sym,d:5,pip:10000}; }
-function isCrypto(sym) { return CRYPTO_SET.has(sym); }
+function symInfo(sym) {
+  return ALL_SYMS.find(s => s.sym === sym) || {sym,d:5,pip:10000};
+}
+function isCrypto(sym) { return CRYPTO.some(c => c.sym === sym); }
 function isTickMode() { return TIMEFRAMES[currentTfIdx].sec === 0; }
-function fmtPrice(v) { return v.toFixed(cachedInfo.d); }
-function spreadUnit() { return (currentSymbol === 'XAUUSD' || isCrypto(currentSymbol)) ? '$' : 'p'; }
+function fmtPrice(v,sym) { return v.toFixed(symInfo(sym).d); }
 
 function candleTimeFor(tsMs) {
   const tf = TIMEFRAMES[currentTfIdx];
@@ -162,7 +154,7 @@ function candleTimeFor(tsMs) {
   if (tf.sec === 604800) { // 1W — Monday 00:00
     const d = new Date(tsSec * 1000);
     const day = d.getUTCDay();
-    const diff = (day + 6) % 7;
+    const diff = (day + 6) % 7; // days since Monday
     d.setUTCDate(d.getUTCDate() - diff);
     d.setUTCHours(0,0,0,0);
     return Math.floor(d.getTime() / 1000);
@@ -170,36 +162,37 @@ function candleTimeFor(tsMs) {
   return Math.floor(tsSec / tf.sec) * tf.sec;
 }
 
-function clearSeries() {
-  candleSeries.setData([]);
-  volumeSeries.setData([]);
-}
-
 /* ── addSeries (v4/v5 compat) ───────────────── */
 function addS(type, opts) {
-  const map = {Candlestick:'CandlestickSeries',Histogram:'HistogramSeries'};
+  const map = {Candlestick:'CandlestickSeries',Histogram:'HistogramSeries',Line:'LineSeries'};
   const st = LightweightCharts[map[type]];
   if (st && chart.addSeries) { try { return chart.addSeries(st, opts); } catch(e){} }
   return chart['add'+type+'Series'](opts);
 }
 
 /* ── UI ─────────────────────────────────────── */
-function appendOptgroup(sel, label, items, selectedSym) {
-  const g = document.createElement('optgroup');
-  g.label = label;
-  items.forEach(({sym}) => {
-    const o = document.createElement('option');
-    o.value = sym; o.textContent = sym;
-    if (sym === selectedSym) o.selected = true;
-    g.appendChild(o);
-  });
-  sel.appendChild(g);
-}
-
 function initUI() {
   const sel = document.getElementById('symbol-select');
-  appendOptgroup(sel, 'Crypto', CRYPTO, currentSymbol);
-  appendOptgroup(sel, 'FX (API Key)', FX, currentSymbol);
+
+  const gCrypto = document.createElement('optgroup');
+  gCrypto.label = 'Crypto';
+  CRYPTO.forEach(c => {
+    const o = document.createElement('option');
+    o.value = c.sym; o.textContent = c.sym;
+    if (c.sym === currentSymbol) o.selected = true;
+    gCrypto.appendChild(o);
+  });
+  sel.appendChild(gCrypto);
+
+  const gFx = document.createElement('optgroup');
+  gFx.label = 'FX (API Key)';
+  FX.forEach(f => {
+    const o = document.createElement('option');
+    o.value = f.sym; o.textContent = f.sym;
+    gFx.appendChild(o);
+  });
+  sel.appendChild(gFx);
+
   sel.onchange = e => onSymbolSelect(e.target.value);
 
   const grp = document.getElementById('tf-group');
@@ -242,6 +235,14 @@ function initChart() {
   volumeSeries = addS('Histogram',{color:'#1a3a5c',priceFormat:{type:'volume'},priceScaleId:'vol'});
   volumeSeries.priceScale().applyOptions({scaleMargins:{top:0.85,bottom:0}});
 
+  bidLineSeries = addS('Line',{
+    color:'rgba(38,166,154,0.45)',lineWidth:1,
+    crosshairMarkerVisible:false,priceLineVisible:false,lastValueVisible:false,
+  });
+  askLineSeries = addS('Line',{
+    color:'rgba(239,83,80,0.45)',lineWidth:1,
+    crosshairMarkerVisible:false,priceLineVisible:false,lastValueVisible:false,
+  });
   candleSeries = addS('Candlestick',{
     upColor:'#26a69a',downColor:'#ef5350',borderVisible:false,
     wickUpColor:'#26a69a',wickDownColor:'#ef5350',
@@ -251,15 +252,61 @@ function initChart() {
 }
 
 function applyPrecision() {
-  cachedInfo = symInfo(currentSymbol);
-  const pf = {type:'price',precision:cachedInfo.d,minMove:Math.pow(10,-cachedInfo.d)};
+  const {d} = symInfo(currentSymbol);
+  const pf = {type:'price',precision:d,minMove:Math.pow(10,-d)};
   candleSeries.applyOptions({priceFormat:pf});
+  bidLineSeries.applyOptions({priceFormat:pf});
+  askLineSeries.applyOptions({priceFormat:pf});
 }
 
-/* ── WebSocket helpers ──────────────────────── */
-function attachWsHandlers() {
-  ws.onclose = () => { $status.className = 'err'; scheduleReconnect(); };
-  ws.onerror = () => { $status.className = 'err'; };
+/* ── Connection: Binance ────────────────────── */
+function connectBinance(symbol) {
+  disconnectWs();
+  const st = document.getElementById('status');
+  const stream = symbol.toLowerCase() + '@bookTicker';
+  ws = new WebSocket('wss://stream.binance.com:9443/ws/' + stream);
+  ws.onopen = () => { st.className = 'ok'; currentSource = 'binance'; };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.b && m.a) {
+      onTick({
+        symbol: m.s,
+        best_bid: m.b,
+        best_ask: m.a,
+        server_ts: Date.now(),
+        is_crossed: parseFloat(m.b) > parseFloat(m.a),
+      });
+    }
+  };
+  ws.onclose = () => { st.className = 'err'; scheduleReconnect(); };
+  ws.onerror = () => { st.className = 'err'; };
+}
+
+/* ── Connection: Tick Aggregator ─────────────── */
+function connectTickAgg(symbol) {
+  disconnectWs();
+  const st = document.getElementById('status');
+  ws = new WebSocket('wss://tick.hugen.tokyo/ws');
+  ws.onopen = () => {
+    ws.send(JSON.stringify({type:'auth',api_key:apiKey}));
+  };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    switch(m.type) {
+      case 'auth_ok':
+        st.className = 'ok';
+        currentSource = 'tickagg';
+        ws.send(JSON.stringify({type:'subscribe',symbols:[symbol]}));
+        break;
+      case 'tick':
+        onTick(m);
+        break;
+      case 'ping': break;
+      case 'error': st.className = 'err'; break;
+    }
+  };
+  ws.onclose = () => { st.className = 'err'; scheduleReconnect(); };
+  ws.onerror = () => { st.className = 'err'; };
 }
 
 function disconnectWs() {
@@ -276,53 +323,16 @@ function scheduleReconnect() {
   }, 3000);
 }
 
-/* ── Connection: Binance ────────────────────── */
-function connectBinance(symbol) {
-  disconnectWs();
-  const stream = symbol.toLowerCase() + '@bookTicker';
-  ws = new WebSocket('wss://stream.binance.com:9443/ws/' + stream);
-  ws.onopen = () => { $status.className = 'ok'; };
-  ws.onmessage = e => {
-    const m = JSON.parse(e.data);
-    if (m.b && m.a) {
-      onTick({
-        symbol: m.s,
-        best_bid: m.b,
-        best_ask: m.a,
-        server_ts: Date.now(),
-        is_crossed: parseFloat(m.b) > parseFloat(m.a),
-      });
-    }
-  };
-  attachWsHandlers();
-}
-
-/* ── Connection: Tick Aggregator ─────────────── */
-function connectTickAgg(symbol) {
-  disconnectWs();
-  ws = new WebSocket('wss://tick.hugen.tokyo/ws');
-  ws.onopen = () => {
-    ws.send(JSON.stringify({type:'auth',api_key:apiKey}));
-  };
-  ws.onmessage = e => {
-    const m = JSON.parse(e.data);
-    switch(m.type) {
-      case 'auth_ok':
-        $status.className = 'ok';
-        ws.send(JSON.stringify({type:'subscribe',symbols:[symbol]}));
-        break;
-      case 'tick': onTick(m); break;
-      case 'ping': break;
-      case 'error': $status.className = 'err'; break;
-    }
-  };
-  attachWsHandlers();
-}
-
-/* ── Symbol Switch (unified) ─────────────────── */
-function switchToSymbol(sym) {
+/* ── Symbol Select ──────────────────────────── */
+function onSymbolSelect(sym) {
+  if (!isCrypto(sym) && !apiKey) {
+    pendingFxSymbol = sym;
+    document.getElementById('auth-overlay').style.display = 'flex';
+    // Reset dropdown to current
+    document.getElementById('symbol-select').value = currentSymbol;
+    return;
+  }
   currentSymbol = sym;
-  document.getElementById('symbol-select').value = sym;
   resetChartState();
   applyPrecision();
   loadHistory(sym, currentTfIdx);
@@ -330,29 +340,18 @@ function switchToSymbol(sym) {
   else connectTickAgg(sym);
 }
 
-function onSymbolSelect(sym) {
-  if (!isCrypto(sym) && !apiKey) {
-    try { apiKey = localStorage.getItem('tick_api_key') || ''; } catch(e) {}
-    if (!apiKey) {
-      pendingFxSymbol = sym;
-      document.getElementById('auth-overlay').style.display = 'flex';
-      try { document.getElementById('api-key-input').value = localStorage.getItem('tick_api_key') || ''; } catch(e) {}
-      document.getElementById('symbol-select').value = currentSymbol;
-      return;
-    }
-  }
-  switchToSymbol(sym);
-}
-
 function submitApiKey() {
   apiKey = document.getElementById('api-key-input').value.trim();
   if (!apiKey) return;
-  try { localStorage.setItem('tick_api_key', apiKey); } catch(e) {}
   document.getElementById('auth-overlay').style.display = 'none';
   if (pendingFxSymbol) {
-    const sym = pendingFxSymbol;
+    currentSymbol = pendingFxSymbol;
+    document.getElementById('symbol-select').value = currentSymbol;
     pendingFxSymbol = null;
-    switchToSymbol(sym);
+    resetChartState();
+    applyPrecision();
+    loadHistory(currentSymbol, currentTfIdx);
+    connectTickAgg(currentSymbol);
   }
 }
 
@@ -365,81 +364,95 @@ function resetChartState() {
   tickBuffer = [];
   currentCandle = null; currentVolume = null;
   candleTickCount = 0; tickModeIdx = 0;
-  historyReqId++; // invalidate any in-flight loadHistory
-  clearSeries();
-  $bid.textContent = '\u2014';
-  $ask.textContent = '\u2014';
-  $spread.textContent = '\u2014';
-  $tps.textContent = '';
-  $candleTicks.textContent = '';
-  _lastBid = ''; _lastAsk = ''; _lastSp = ''; _lastCrossed = null;
+  candleSeries.setData([]);
+  volumeSeries.setData([]);
+  bidLineSeries.setData([]);
+  askLineSeries.setData([]);
+  document.getElementById('bid-val').textContent = '\u2014';
+  document.getElementById('ask-val').textContent = '\u2014';
+  document.getElementById('spread-val').textContent = '\u2014';
+  document.getElementById('tps').textContent = '';
+  document.getElementById('candle-ticks').textContent = '';
 }
 
-/* ── Tick Handler (hot path) ──────────────────── */
+/* ── Tick Handler (common) ──────────────────── */
 function onTick(tick) {
-  if (tick.symbol !== currentSymbol) return;
+  const sym = tick.symbol;
+  if (sym !== currentSymbol) return;
 
   const bid = parseFloat(tick.best_bid);
   const ask = parseFloat(tick.best_ask);
   const mid = (bid + ask) / 2;
   const ts = tick.server_ts;
 
-  // Price display (with change detection)
-  const bt = fmtPrice(bid);
-  const at = fmtPrice(ask);
-  if (bt !== _lastBid) { $bid.textContent = bt; _lastBid = bt; }
-  if (at !== _lastAsk) { $ask.textContent = at; _lastAsk = at; }
-  const sp = ((ask - bid) * cachedInfo.pip).toFixed(1) + spreadUnit();
-  if (sp !== _lastSp) { $spread.textContent = sp; _lastSp = sp; }
-  const crossed = tick.is_crossed;
-  if (crossed !== _lastCrossed) {
-    $spread.className = 'spread' + (crossed ? ' crossed' : '');
-    _lastCrossed = crossed;
-  }
+  updatePriceUI(bid, ask, tick.is_crossed);
 
-  // Tick rate
   tpsCount++;
   const now = performance.now();
   if (now - tpsLast >= 1000) {
-    $tps.textContent = tpsCount + ' t/s';
+    document.getElementById('tps').textContent = tpsCount + ' t/s';
     tpsCount = 0; tpsLast = now;
   }
 
-  // Buffer with hard cap
   tickBuffer.push({bid,ask,mid,ts});
-  if (tickBuffer.length > BUFFER_MAX) {
-    tickBuffer = tickBuffer.slice(-BUFFER_MAX);
-  } else if (tickBuffer.length > 1000 && tickBuffer[0].ts < ts - BUFFER_MS) {
-    // Batch trim every 1000 ticks
-    if (tickBuffer.length % 1000 === 0) {
-      const cutoff = ts - BUFFER_MS;
-      let lo = 0, hi = tickBuffer.length;
-      while (lo < hi) { const m = (lo+hi)>>>1; if (tickBuffer[m].ts < cutoff) lo=m+1; else hi=m; }
-      if (lo > 0) tickBuffer = tickBuffer.slice(lo);
-    }
+  if (tickBuffer.length > 1 && tickBuffer[0].ts < ts - BUFFER_MS) {
+    let c = 0;
+    const cutoff = ts - BUFFER_MS;
+    while (c < tickBuffer.length && tickBuffer[c].ts < cutoff) c++;
+    if (c > 0) tickBuffer.splice(0, c);
   }
 
-  if (isTickMode()) {
-    tickModeIdx++;
-    $candleTicks.textContent = tickModeIdx + ' ticks';
-  } else {
-    updateCandleMode(mid, ts);
-  }
+  if (isTickMode()) updateTickMode(bid, ask, mid);
+  else updateCandleMode(bid, ask, mid, ts);
+}
+
+function updatePriceUI(bid, ask, crossed) {
+  const sym = currentSymbol;
+  document.getElementById('bid-val').textContent = fmtPrice(bid, sym);
+  document.getElementById('ask-val').textContent = fmtPrice(ask, sym);
+  const sp = ask - bid;
+  const {pip} = symInfo(sym);
+  const spEl = document.getElementById('spread-val');
+  spEl.textContent = (sp * pip).toFixed(1) + (sym === 'XAUUSD' ? '$' : sym.includes('BTC') || sym.includes('ETH') ? '$' : 'p');
+  spEl.className = 'spread' + (crossed ? ' crossed' : '');
 }
 
 /* ── Tick Mode ──────────────────────────────── */
+function updateTickMode(bid, ask, mid) {
+  tickModeIdx++;
+  const t = tickModeBase + tickModeIdx;
+  bidLineSeries.update({time:t, value:bid});
+  askLineSeries.update({time:t, value:ask});
+  document.getElementById('candle-ticks').textContent = tickModeIdx + ' ticks';
+}
+
 function rebuildTickMode() {
-  clearSeries();
+  // Clear ALL series to avoid stale data conflicts
+  candleSeries.setData([]);
+  volumeSeries.setData([]);
+  bidLineSeries.setData([]);
+  askLineSeries.setData([]);
   currentCandle = null; currentVolume = null;
+  bidLineSeries.applyOptions({color:'rgba(38,166,154,0.8)',lineWidth:1});
+  askLineSeries.applyOptions({color:'rgba(239,83,80,0.8)',lineWidth:1});
+
   const slice = tickBuffer.slice(-TICK_MAX);
   tickModeBase = Math.floor(Date.now()/1000) + JST - slice.length;
-  tickModeIdx = slice.length;
+  tickModeIdx = 0;
+  const bd = [], ad = [];
+  slice.forEach(({bid,ask}) => {
+    tickModeIdx++;
+    const t = tickModeBase + tickModeIdx;
+    bd.push({time:t,value:bid});
+    ad.push({time:t,value:ask});
+  });
+  bidLineSeries.setData(bd); askLineSeries.setData(ad);
   chart.timeScale().fitContent();
-  $candleTicks.textContent = tickModeIdx + ' ticks';
+  document.getElementById('candle-ticks').textContent = tickModeIdx + ' ticks';
 }
 
 /* ── Candle Mode ────────────────────────────── */
-function updateCandleMode(mid, tsMs) {
+function updateCandleMode(bid, ask, mid, tsMs) {
   const ct = candleTimeFor(tsMs);
   if (!currentCandle || currentCandle.time !== ct) {
     candleTickCount = 1;
@@ -454,31 +467,35 @@ function updateCandleMode(mid, tsMs) {
   }
   candleSeries.update(currentCandle);
   volumeSeries.update(currentVolume);
-  $candleTicks.textContent = candleTickCount + ' ticks';
+  document.getElementById('candle-ticks').textContent = candleTickCount + ' ticks';
 }
 
 function rebuildCandleMode() {
-  clearSeries();
+  // Clear ALL series first to purge any tick-mode fake timestamps
+  candleSeries.setData([]);
+  volumeSeries.setData([]);
+  bidLineSeries.setData([]);
+  askLineSeries.setData([]);
+  bidLineSeries.applyOptions({color:'rgba(38,166,154,0.45)',lineWidth:1});
+  askLineSeries.applyOptions({color:'rgba(239,83,80,0.45)',lineWidth:1});
+
   const candleMap = new Map();
-  tickBuffer.forEach(({mid,ts}) => {
+  tickBuffer.forEach(({bid,ask,mid,ts}) => {
     const ct = candleTimeFor(ts);
     if (!candleMap.has(ct)) {
-      candleMap.set(ct,{time:ct,open:mid,high:mid,low:mid,close:mid,n:1});
+      candleMap.set(ct,{time:ct,open:mid,high:mid,low:mid,close:mid,bidC:bid,askC:ask,n:1});
     } else {
       const c = candleMap.get(ct);
       c.high = Math.max(c.high, mid); c.low = Math.min(c.low, mid);
-      c.close = mid; c.n++;
+      c.close = mid; c.bidC = bid; c.askC = ask; c.n++;
     }
   });
   const sorted = Array.from(candleMap.values()).sort((a,b) => a.time - b.time);
 
-  const cData = [], vData = [];
-  for (const c of sorted) {
-    cData.push({time:c.time,open:c.open,high:c.high,low:c.low,close:c.close});
-    vData.push({time:c.time,value:c.n,color:'#1a3a5c'});
-  }
-  candleSeries.setData(cData);
-  volumeSeries.setData(vData);
+  candleSeries.setData(sorted.map(c=>({time:c.time,open:c.open,high:c.high,low:c.low,close:c.close})));
+  volumeSeries.setData(sorted.map(c=>({time:c.time,value:c.n,color:'#1a3a5c'})));
+  bidLineSeries.setData([]);
+  askLineSeries.setData([]);
 
   if (sorted.length > 0) {
     const last = sorted[sorted.length-1];
@@ -491,6 +508,7 @@ function rebuildCandleMode() {
   chart.timeScale().fitContent();
 }
 
+/* ── Rebuild ────────────────────────────────── */
 function rebuildFromBuffer() {
   if (isTickMode()) rebuildTickMode(); else rebuildCandleMode();
 }
@@ -503,47 +521,51 @@ const BINANCE_TF_MAP = {
 
 async function loadHistory(symbol, tfIdx) {
   if (isTickMode()) return;
-  const reqId = ++historyReqId;
   const sec = TIMEFRAMES[tfIdx].sec;
 
   if (isCrypto(symbol)) {
     const interval = BINANCE_TF_MAP[sec];
-    if (!interval) return;
+    if (!interval) return; // 5s/15s/30s — no Binance kline, fills fast anyway
     try {
       const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=1000`;
       const res = await fetch(url);
-      if (!res.ok || reqId !== historyReqId) return;
+      if (!res.ok) return;
       const raw = await res.json();
-      if (reqId !== historyReqId) return; // stale check after await
+      // Binance kline: [openTime,open,high,low,close,volume,closeTime,...]
       const candles = [], vols = [];
       raw.forEach(k => {
         const t = Math.floor(k[0]/1000) + JST;
-        candles.push({time:t,open:parseFloat(k[1]),high:parseFloat(k[2]),low:parseFloat(k[3]),close:parseFloat(k[4])});
-        vols.push({time:t,value:Math.round(parseFloat(k[5])*100)/100,color:'#1a3a5c'});
+        const o = parseFloat(k[1]), h = parseFloat(k[2]);
+        const l = parseFloat(k[3]), c = parseFloat(k[4]);
+        const v = parseFloat(k[5]);
+        candles.push({time:t,open:o,high:h,low:l,close:c});
+        vols.push({time:t,value:Math.round(v*100)/100,color:'#1a3a5c'});
       });
-      if (candles.length > 0 && reqId === historyReqId) {
+      if (candles.length > 0) {
         candleSeries.setData(candles);
         volumeSeries.setData(vols);
-        currentCandle = {...candles[candles.length-1]};
+        const last = candles[candles.length-1];
+        currentCandle = {...last};
         currentVolume = vols[vols.length-1];
         candleTickCount = 0;
         chart.timeScale().fitContent();
       }
-    } catch(e) { /* silent */ }
+    } catch(e) { /* silent — chart starts empty */ }
   } else {
+    // FX: try tick-aggregator history endpoint (future)
     try {
       const tfLabel = TIMEFRAMES[tfIdx].label;
       const res = await fetch(
         `https://tick.hugen.tokyo/api/v1/candles/${symbol}?tf=${tfLabel}&count=1000`,
         {headers:{'Authorization':'Bearer '+apiKey}}
       );
-      if (!res.ok || reqId !== historyReqId) return;
+      if (!res.ok) return;
       const raw = await res.json();
-      if (reqId !== historyReqId) return;
       const data = raw.map(d => ({...d, time: d.time + JST}));
-      if (data.length > 0 && reqId === historyReqId) {
+      if (data.length > 0) {
         candleSeries.setData(data);
-        currentCandle = {...data[data.length-1]};
+        const last = data[data.length-1];
+        currentCandle = {...last};
         candleTickCount = 0;
         chart.timeScale().fitContent();
       }
@@ -553,14 +575,6 @@ async function loadHistory(symbol, tfIdx) {
 
 /* ── Boot ───────────────────────────────────── */
 (function boot() {
-  // Cache DOM elements
-  $bid = document.getElementById('bid-val');
-  $ask = document.getElementById('ask-val');
-  $spread = document.getElementById('spread-val');
-  $tps = document.getElementById('tps');
-  $candleTicks = document.getElementById('candle-ticks');
-  $status = document.getElementById('status');
-
   initUI();
   initChart();
   loadHistory(currentSymbol, currentTfIdx);
