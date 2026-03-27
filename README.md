@@ -2,7 +2,7 @@
 
 Open-source tick chart viewer. One HTML file. No install.
 
-Built with [Lightweight Charts](https://github.com/nickvdyck/lightweight-charts) by TradingView.
+Built with [Lightweight Charts](https://github.com/tradingview/lightweight-charts) by TradingView.
 
 ## Features
 
